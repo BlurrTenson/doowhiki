@@ -9,7 +9,24 @@ local priority_weights = {}
 
 M.todos = {}
 M.current_save_path = nil
+M.current_scratchpad_save_dir = nil
 M.current_context = "global" -- Track current context: "global" or project name
+
+local deleted_todos = {}
+local MAX_UNDO_HISTORY = 100
+
+-- Store an undo entry (can contain multiple deleted items and modified items)
+function M.store_undo_entry(deleted, modified)
+	table.insert(deleted_todos, 1, {
+		deleted = deleted or {},
+		modified = modified or {},
+		timestamp = os.time(),
+	})
+	-- Keep only the last MAX_UNDO_HISTORY deletions
+	if #deleted_todos > MAX_UNDO_HISTORY then
+		table.remove(deleted_todos)
+	end
+end
 
 -- Update priority weights cache when config changes
 local function update_priority_weights()
@@ -56,16 +73,100 @@ local function save_todos()
 	end
 end
 
--- Expose it as part of the module
-M.save_todos = save_todos
-M.save_todos_to_current_path = function()
-	local save_path = M.current_save_path or config.options.save_path
-	local file = io.open(save_path, "w")
-	if file then
-		file:write(encode_json(M.todos))
-		file:close()
+local function get_scratchpad_save_dir(path)
+	local opts = config.options.scratchpad or config.defaults.scratchpad
+	if opts.use_files then
+		local savedir = opts.savedir or ".dooing_scratchpads"
+		-- Ensure savedir doesn't start with / if we want it relative to path
+		if savedir:match("^/") then
+			return savedir
+		end
+		return path .. savedir
+	end
+	return nil
+end
+
+function M.get_todo_scratchpad_path(todo)
+	if not todo or not todo.id then
+		return nil
+	end
+
+	local root = M.current_scratchpad_save_dir
+	if not root then
+		-- Fallback to default if not set (e.g. during initial setup before load_todos)
+		local base = vim.fn.fnamemodify(config.options.save_path, ":h") .. "/"
+		root = get_scratchpad_save_dir(base)
+	end
+
+	if not root then
+		return nil
+	end
+
+	-- Ensure root ends with /
+	if not root:match("/$") then
+		root = root .. "/"
+	end
+
+	local path_parts = { todo.id }
+	local current = todo
+	local max_depth = 20 -- Safety break
+	local d = 0
+	while current.parent_id and d < max_depth do
+		local parent = nil
+		for _, t in ipairs(M.todos) do
+			if t.id == current.parent_id then
+				parent = t
+				break
+			end
+		end
+
+		if parent then
+			table.insert(path_parts, 1, parent.id)
+			current = parent
+			d = d + 1
+		else
+			break
+		end
+	end
+
+	local opts = config.options.scratchpad or config.defaults.scratchpad
+	local ext = opts.files_extension or "md"
+	return root .. table.concat(path_parts, "/") .. "/scratch." .. ext
+end
+
+function M.cleanup_empty_dirs(dir)
+	local root = M.current_scratchpad_save_dir
+	if not root or not dir or dir == "" then
+		return
+	end
+
+	-- Ensure absolute path for comparison
+	dir = vim.fn.fnamemodify(dir, ":p")
+	root = vim.fn.fnamemodify(root, ":p")
+
+	-- Ensure trailing slashes
+	if not root:match("/$") then
+		root = root .. "/"
+	end
+	if not dir:match("/$") then
+		dir = dir .. "/"
+	end
+
+	-- Don't delete outside root or the root itself
+	if not dir:find(root, 1, true) or dir == root then
+		return
+	end
+
+	if vim.fn.isdirectory(dir) == 1 and vim.fn.glob(dir .. "*") == "" then
+		vim.fn.delete(dir, "d")
+		-- Recursively try to clean up parent
+		local parent_dir = vim.fn.fnamemodify(dir, ":h")
+		M.cleanup_empty_dirs(parent_dir)
 	end
 end
+-- Expose it as part of the module
+M.save_todos = save_todos
+M.save_todos_to_current_path = save_todos
 
 -- Get git root directory
 function M.get_git_root()
@@ -150,7 +251,7 @@ end
 -- Load todos from specific path
 function M.load_todos_from_path(path)
 	M.current_save_path = path
-
+	M.current_scratchpad_save_dir = get_scratchpad_save_dir(vim.fn.fnamemodify(path, ":h") .. "/")
 	-- Set context based on path
 	local git_root = M.get_git_root()
 	if git_root then
@@ -222,6 +323,7 @@ end
 
 function M.load_todos()
 	M.current_save_path = config.options.save_path
+	M.current_scratchpad_save_dir = get_scratchpad_save_dir(vim.fn.fnamemodify(config.options.save_path, ":h") .. "/")
 	M.current_context = "global"
 	update_priority_weights()
 	local file = io.open(M.current_save_path, "r")
@@ -463,79 +565,209 @@ function M.set_filter(tag)
 end
 
 function M.delete_todo(index)
-	if M.todos[index] then
-		table.remove(M.todos, index)
-		save_todos()
+	local todo = M.todos[index]
+	if not todo then
+		return
 	end
-end
 
-function M.delete_completed()
-	if M.nested_tasks_enabled() then
-		M.delete_completed_structure_aware()
-	else
-		M.delete_completed_flat()
-	end
-end
+	local deleted = { { todo = vim.deepcopy(todo), index = index } }
+	local modified = {}
 
--- Original delete completed (preserves old behavior when nested tasks disabled)
-function M.delete_completed_flat()
-	local remaining_todos = {}
-	for _, todo in ipairs(M.todos) do
-		if not todo.done then
-			table.insert(remaining_todos, todo)
+	-- Collect scratchpad paths before mutation
+	local use_files = config.options.scratchpad and config.options.scratchpad.use_files
+	local old_scratchpad_paths = {}
+	if use_files then
+		old_scratchpad_paths[todo.id] = M.get_todo_scratchpad_path(todo)
+		-- Collect children's old paths
+		for _, t in ipairs(M.todos) do
+			if t.parent_id == todo.id then
+				old_scratchpad_paths[t.id] = M.get_todo_scratchpad_path(t)
+			end
 		end
 	end
-	M.todos = remaining_todos
+
+	table.remove(M.todos, index)
+
+	-- Handle orphans if nested tasks are enabled
+	if config.options.nested_tasks and config.options.nested_tasks.enabled then
+		for _, t in ipairs(M.todos) do
+			if t.parent_id == todo.id then
+				-- This is a direct orphan of the deleted todo
+				table.insert(modified, {
+					id = t.id,
+					parent_id = t.parent_id,
+					depth = t.depth,
+				})
+
+				local old_depth = t.depth or 0
+				t.parent_id = nil
+				t.depth = 0
+
+				-- Adjust all descendants of this promoted todo
+				local function adjust_descendants(p_id, delta)
+					for _, child in ipairs(M.todos) do
+						if child.parent_id == p_id then
+							table.insert(modified, {
+								id = child.id,
+								parent_id = child.parent_id,
+								depth = child.depth,
+							})
+							child.depth = (child.depth or 0) - delta
+							adjust_descendants(child.id, delta)
+						end
+					end
+				end
+				adjust_descendants(t.id, old_depth)
+			end
+		end
+	end
+
+	-- Handle scratchpad files
+	if use_files then
+		-- 1. Delete scratchpad of the deleted todo
+		local del_path = old_scratchpad_paths[todo.id]
+		if del_path and vim.fn.filereadable(del_path) == 1 then
+			vim.fn.delete(del_path)
+		end
+
+		-- 2. Move promoted children's scratchpad directories
+		-- When we move a direct child's directory, all its descendants move with it.
+		for _, t in ipairs(M.todos) do
+			-- We only care about DIRECT children of the deleted todo that were promoted
+			if old_scratchpad_paths[t.id] and t.parent_id == nil then
+				local new_path = M.get_todo_scratchpad_path(t)
+				if new_path and old_scratchpad_paths[t.id] ~= new_path then
+					local old_dir = vim.fn.fnamemodify(old_scratchpad_paths[t.id], ":h")
+					local new_dir = vim.fn.fnamemodify(new_path, ":h")
+					if vim.fn.isdirectory(old_dir) == 1 then
+						vim.fn.mkdir(vim.fn.fnamemodify(new_dir, ":h"), "p")
+						vim.fn.rename(old_dir, new_dir)
+						-- Clean up old parent dir if it's now empty
+						M.cleanup_empty_dirs(vim.fn.fnamemodify(old_dir, ":h"))
+					end
+				end
+			end
+		end
+
+		-- 3. Final cleanup of the deleted todo's directory
+		if del_path then
+			M.cleanup_empty_dirs(vim.fn.fnamemodify(del_path, ":h"))
+		end
+	end
+
+	M.store_undo_entry(deleted, modified)
 	save_todos()
 end
 
--- Structure-aware delete completed that handles orphaned nested tasks
-function M.delete_completed_structure_aware()
-	local remaining_todos = {}
-	local orphaned_todos = {}
+function M.delete_completed()
+	local deleted = {}
+	local modified = {}
+	local remaining = {}
+	local deleted_ids = {}
 
-	-- First pass: collect remaining todos and identify orphans
-	for _, todo in ipairs(M.todos) do
-		if not todo.done then
-			table.insert(remaining_todos, todo)
-		elseif todo.parent_id then
-			-- This is a completed nested task, check if parent still exists
-			local parent_exists = false
-			for _, remaining in ipairs(remaining_todos) do
-				if remaining.id == todo.parent_id then
-					parent_exists = true
-					break
+	-- Collect scratchpad paths before mutation
+	local use_files = config.options.scratchpad and config.options.scratchpad.use_files
+	local old_scratchpad_paths = {}
+	if use_files then
+		for _, todo in ipairs(M.todos) do
+			old_scratchpad_paths[todo.id] = M.get_todo_scratchpad_path(todo)
+		end
+	end
+
+	-- 1. Identify what to delete
+	for i, todo in ipairs(M.todos) do
+		if todo.done then
+			table.insert(deleted, { todo = vim.deepcopy(todo), index = i })
+			deleted_ids[todo.id] = true
+		else
+			table.insert(remaining, todo)
+		end
+	end
+
+	if #deleted == 0 then
+		return
+	end
+
+	-- 2. Handle orphans in remaining todos if nested tasks are enabled
+	if config.options.nested_tasks and config.options.nested_tasks.enabled then
+		for _, todo in ipairs(remaining) do
+			if todo.parent_id and deleted_ids[todo.parent_id] then
+				-- This is a direct orphan of a deleted parent
+				table.insert(modified, {
+					id = todo.id,
+					parent_id = todo.parent_id,
+					depth = todo.depth,
+				})
+
+				local old_depth = todo.depth or 0
+				todo.parent_id = nil
+				todo.depth = 0
+
+				-- Adjust all descendants of this promoted todo
+				local function adjust_descendants(p_id, delta)
+					for _, t in ipairs(remaining) do
+						if t.parent_id == p_id then
+							table.insert(modified, {
+								id = t.id,
+								parent_id = t.parent_id,
+								depth = t.depth,
+							})
+							t.depth = (t.depth or 0) - delta
+							adjust_descendants(t.id, delta)
+						end
+					end
+				end
+				adjust_descendants(todo.id, old_depth)
+			end
+		end
+	end
+
+	-- Handle scratchpad files
+	if use_files then
+		-- 1. Delete scratchpads of deleted todos
+		for _, del_item in ipairs(deleted) do
+			local todo = del_item.todo
+			local del_path = old_scratchpad_paths[todo.id]
+			if del_path and vim.fn.filereadable(del_path) == 1 then
+				vim.fn.delete(del_path)
+			end
+		end
+
+		-- 2. Move promoted remaining's scratchpad directories
+		-- We only move direct orphans (parent was deleted and now they have no parent)
+		-- because their whole directory tree moves with them.
+		for _, t in ipairs(remaining) do
+			if old_scratchpad_paths[t.id] and t.parent_id == nil then
+				-- Temporary switch state.todos to compute path in new context
+				local old_state_todos = M.todos
+				M.todos = remaining
+				local new_path = M.get_todo_scratchpad_path(t)
+				M.todos = old_state_todos
+
+				if new_path and old_scratchpad_paths[t.id] ~= new_path then
+					local old_dir = vim.fn.fnamemodify(old_scratchpad_paths[t.id], ":h")
+					local new_dir = vim.fn.fnamemodify(new_path, ":h")
+					if vim.fn.isdirectory(old_dir) == 1 then
+						vim.fn.mkdir(vim.fn.fnamemodify(new_dir, ":h"), "p")
+						vim.fn.rename(old_dir, new_dir)
+						-- Clean up old parent dir if it's now empty
+						M.cleanup_empty_dirs(vim.fn.fnamemodify(old_dir, ":h"))
+					end
 				end
 			end
-			-- If parent doesn't exist yet, we'll check in the final list
-			table.insert(orphaned_todos, todo)
-		end
-	end
-
-	-- Second pass: handle orphaned nested tasks
-	for _, orphan in ipairs(orphaned_todos) do
-		local parent_exists = false
-		for _, remaining in ipairs(remaining_todos) do
-			if remaining.id == orphan.parent_id then
-				parent_exists = true
-				break
-			end
 		end
 
-		if parent_exists then
-			-- Parent still exists, keep the orphaned task
-			table.insert(remaining_todos, orphan)
-		else
-			-- Parent was deleted, promote orphan to top-level if not completed
-			if not orphan.done then
-				orphan.parent_id = nil
-				orphan.depth = 0
-				table.insert(remaining_todos, orphan)
+		-- 3. Final cleanup for all deleted todos
+		for _, del_item in ipairs(deleted) do
+			local del_path = old_scratchpad_paths[del_item.todo.id]
+			if del_path then
+				M.cleanup_empty_dirs(vim.fn.fnamemodify(del_path, ":h"))
 			end
 		end
 	end
 
-	M.todos = remaining_todos
+	M.todos = remaining
+	M.store_undo_entry(deleted, modified)
 	save_todos()
 end
 
@@ -1111,10 +1343,6 @@ function M.delete_todo_with_confirmation(todo_index, win_id, calendar, callback)
 		once = true,
 	})
 end
--- In state.lua, add these at the top with other local variables:
-local deleted_todos = {}
-local MAX_UNDO_HISTORY = 100
-
 -- Get count of due and overdue todos
 function M.get_due_count()
 	local now = os.time()
@@ -1159,66 +1387,87 @@ function M.show_due_notification()
 	vim.notify(message, vim.log.levels.ERROR, { title = "Dooing" })
 end
 
--- Add these functions to state.lua:
-function M.store_deleted_todo(todo, index)
-	table.insert(deleted_todos, 1, {
-		todo = vim.deepcopy(todo),
-		index = index,
-		timestamp = os.time(),
-	})
-	-- Keep only the last MAX_UNDO_HISTORY deletions
-	if #deleted_todos > MAX_UNDO_HISTORY then
-		table.remove(deleted_todos)
-	end
-end
-
 function M.undo_delete()
 	if #deleted_todos == 0 then
 		vim.notify("No more todos to restore", vim.log.levels.INFO)
 		return false
 	end
 
-	local last_deleted = table.remove(deleted_todos, 1)
+	local entry = table.remove(deleted_todos, 1)
+	local use_files = config.options.scratchpad and config.options.scratchpad.use_files
+	local old_scratchpad_paths = {}
+	local deleted_ids = {}
 
-	-- If index is greater than current todos length, append to end
-	local insert_index = math.min(last_deleted.index, #M.todos + 1)
-
-	-- Insert the todo at the original position
-	table.insert(M.todos, insert_index, last_deleted.todo)
-
-	-- Save the updated todos
-	M.save_todos()
-
-	-- Return true to indicate successful undo
-	return true
-end
-
--- Modify the delete_todo function in state.lua:
-function M.delete_todo(index)
-	if M.todos[index] then
-		local todo = M.todos[index]
-		M.store_deleted_todo(todo, index)
-		table.remove(M.todos, index)
-		save_todos()
+	for _, item in ipairs(entry.deleted) do
+		deleted_ids[item.todo.id] = true
 	end
-end
 
--- Add to delete_completed in state.lua:
-function M.delete_completed()
-	local remaining_todos = {}
-	local removed_count = 0
-
-	for i, todo in ipairs(M.todos) do
-		if todo.done then
-			M.store_deleted_todo(todo, i - removed_count)
-			removed_count = removed_count + 1
-		else
-			table.insert(remaining_todos, todo)
+	if use_files then
+		-- Collect current paths for modified items BEFORE restoring structure
+		for _, mod in ipairs(entry.modified) do
+			for _, t in ipairs(M.todos) do
+				if t.id == mod.id then
+					old_scratchpad_paths[t.id] = M.get_todo_scratchpad_path(t)
+					break
+				end
+			end
 		end
 	end
 
-	M.todos = remaining_todos
+	-- 1. Restore modified items (un-promote)
+	-- We do this first so that when we restore deleted items, the modified ones are already pointing to them correctly
+	for _, mod in ipairs(entry.modified) do
+		for _, todo in ipairs(M.todos) do
+			if todo.id == mod.id then
+				todo.parent_id = mod.parent_id
+				todo.depth = mod.depth
+				break
+			end
+		end
+	end
+
+	-- 2. Restore deleted items
+	-- Sort by index ascending to restore them in the correct relative order
+	table.sort(entry.deleted, function(a, b)
+		return a.index < b.index
+	end)
+
+	for _, item in ipairs(entry.deleted) do
+		local insert_index = math.min(item.index, #M.todos + 1)
+		table.insert(M.todos, insert_index, item.todo)
+	end
+
+	-- 3. Handle scratchpad files
+	if use_files then
+		for _, mod in ipairs(entry.modified) do
+			-- We only move back direct orphans (those whose parent was deleted and is now being restored)
+			-- because their whole directory tree moves back with them.
+			if deleted_ids[mod.parent_id] then
+				local todo = nil
+				for _, t in ipairs(M.todos) do
+					if t.id == mod.id then
+						todo = t
+						break
+					end
+				end
+
+				if todo and old_scratchpad_paths[todo.id] then
+					local new_path = M.get_todo_scratchpad_path(todo)
+					if new_path and old_scratchpad_paths[todo.id] ~= new_path then
+						local old_dir = vim.fn.fnamemodify(old_scratchpad_paths[todo.id], ":h")
+						local new_dir = vim.fn.fnamemodify(new_path, ":h")
+						if vim.fn.isdirectory(old_dir) == 1 then
+							vim.fn.mkdir(vim.fn.fnamemodify(new_dir, ":h"), "p")
+							vim.fn.rename(old_dir, new_dir)
+						end
+					end
+				end
+			end
+		end
+	end
+
 	save_todos()
+	return true
 end
 
 return M

@@ -132,6 +132,9 @@ M.defaults = {
 	},
 	scratchpad = {
 		syntax_highlight = "markdown",
+		use_files = false,
+		savedir = ".dooing_scratchpads",
+		files_extension = "md",
 	},
 }
 
