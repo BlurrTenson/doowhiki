@@ -14,32 +14,32 @@ local function save_fold_state()
 	if not constants.win_id or not vim.api.nvim_win_is_valid(constants.win_id) then
 		return {}
 	end
-	
+
 	local ok, result = pcall(function()
 		local folds = {}
 		local line_count = vim.api.nvim_buf_line_count(constants.buf_id)
-		
+
 		-- Save the current window to restore later
 		local current_win = vim.api.nvim_get_current_win()
 		vim.api.nvim_set_current_win(constants.win_id)
-		
+
 		-- Build a map of line numbers to todo indices
 		local line_to_todo = {}
 		local todo_line = state.active_filter and 3 or 1 -- Start after header
-		
+
 		for i, todo in ipairs(state.todos) do
 			if not state.active_filter or todo.text:match("#" .. state.active_filter) then
 				todo_line = todo_line + 1
 				line_to_todo[todo_line] = i
 			end
 		end
-		
+
 		-- Check which todos have closed folds
 		for line = 1, line_count do
 			local fold_level = vim.fn.foldlevel(line)
 			local is_closed = vim.fn.foldclosed(line) > 0
 			local todo_index = line_to_todo[line]
-			
+
 			if fold_level > 0 and is_closed and todo_index then
 				local todo = state.todos[todo_index]
 				if todo and todo.id then
@@ -47,36 +47,41 @@ local function save_fold_state()
 				end
 			end
 		end
-		
+
 		-- Restore the previous window
 		if vim.api.nvim_win_is_valid(current_win) then
 			vim.api.nvim_set_current_win(current_win)
 		end
-		
+
 		return folds
 	end)
-	
+
 	return ok and result or {}
 end
 
 -- Restore the fold state
 local function restore_fold_state(folds)
-	if not constants.win_id or not vim.api.nvim_win_is_valid(constants.win_id) or not folds or vim.tbl_isempty(folds) then
+	if
+		not constants.win_id
+		or not vim.api.nvim_win_is_valid(constants.win_id)
+		or not folds
+		or vim.tbl_isempty(folds)
+	then
 		return
 	end
-	
+
 	pcall(function()
 		-- Save the current window to restore later
 		local current_win = vim.api.nvim_get_current_win()
 		vim.api.nvim_set_current_win(constants.win_id)
-		
+
 		-- First, open all folds
 		vim.cmd("normal! zR")
-		
+
 		-- Build a map of todo IDs to line numbers
 		local todo_to_line = {}
 		local todo_line = state.active_filter and 3 or 1 -- Start after header
-		
+
 		for i, todo in ipairs(state.todos) do
 			if not state.active_filter or todo.text:match("#" .. state.active_filter) then
 				todo_line = todo_line + 1
@@ -85,18 +90,18 @@ local function restore_fold_state(folds)
 				end
 			end
 		end
-		
+
 		-- Close folds for todos that were previously folded
 		for todo_id, _ in pairs(folds) do
 			local line = todo_to_line[todo_id]
 			if line and line <= vim.api.nvim_buf_line_count(constants.buf_id) then
-				vim.api.nvim_win_set_cursor(constants.win_id, {line, 0})
+				vim.api.nvim_win_set_cursor(constants.win_id, { line, 0 })
 				if vim.fn.foldlevel(line) > 0 then
 					vim.cmd("normal! zc")
 				end
 			end
 		end
-		
+
 		-- Restore the previous window
 		if vim.api.nvim_win_is_valid(current_win) then
 			vim.api.nvim_set_current_win(current_win)
@@ -139,8 +144,9 @@ function M.render_todos()
 
 	-- Get window width for timestamp positioning
 	local window_width = config.options.window.width
-	
+
 	-- Loop through all todos and render them using the format
+	local todo_metadata = { false } -- Initialize with false to match the first empty line
 	for _, todo in ipairs(state.todos) do
 		if not state.active_filter or todo.text:match("#" .. state.active_filter) then
 			-- use the appropriate format based on the todo's status and lang
@@ -149,34 +155,99 @@ function M.render_todos()
 			else
 				tmp_notes_icon = notes_icon
 			end
-			
+
 			-- Calculate indentation based on depth
 			local depth = todo.depth or 0
-			local indent_size = config.options.nested_tasks and config.options.nested_tasks.indent or 2
-			local base_indent = "  " -- Base indentation for all todos
-			local nested_indent = string.rep(" ", depth * indent_size)
-			local total_indent = base_indent .. nested_indent
-			
+			local prefix_width = 2 + (depth * 2)
+			local buffer_indent = string.rep(" ", prefix_width)
+
 			-- Adjust window width for indentation
-			local effective_width = window_width - vim.fn.strdisplaywidth(total_indent)
-			
-			local todo_text = utils.render_todo(todo, formatting, lang, tmp_notes_icon, effective_width)
-			
-			table.insert(lines, total_indent .. todo_text)
+			local effective_width = window_width - prefix_width * 2
+
+			local todo_text = utils.render_todo(todo, formatting, lang, "", effective_width)
+			table.insert(lines, buffer_indent .. todo_text)
+			table.insert(todo_metadata, { notes_icon = tmp_notes_icon, depth = depth })
 		end
 	end
 
 	if state.active_filter then
 		table.insert(lines, 1, "")
 		table.insert(lines, 1, "  Filtered by: #" .. state.active_filter)
+		-- Offset metadata for the two header lines
+		table.insert(todo_metadata, 1, false)
+		table.insert(todo_metadata, 1, false)
 	end
 
 	table.insert(lines, "")
+	table.insert(todo_metadata, false)
 
 	for i, line in ipairs(lines) do
 		lines[i] = line:gsub("\n", " ")
 	end
 	vim.api.nvim_buf_set_lines(constants.buf_id, 0, -1, false, lines)
+
+	-- Apply virtual text for icons and bars
+	for i, meta in ipairs(todo_metadata) do
+		if meta then
+			local line_nr = i - 1
+			-- Notes icon
+			if meta.notes_icon ~= "" then
+				vim.api.nvim_buf_set_extmark(constants.buf_id, constants.ns_id, line_nr, 0, {
+					virt_text = { { meta.notes_icon, "DooingNotesIcon" } },
+					virt_text_pos = "overlay",
+				})
+			end
+			-- Nested bars
+			for d = 0, meta.depth - 1 do
+				local bar_col = 3 + (d * 2) + 1
+				local symbol = "│"
+				local should_continue = false
+
+				for j = i + 1, #todo_metadata do
+					local next_meta = todo_metadata[j]
+					if next_meta then
+						if next_meta.depth == d + 1 then
+							should_continue = true
+							break
+						elseif next_meta.depth <= d then
+							should_continue = false
+							break
+						end
+					end
+				end
+
+				local is_connection = (d == meta.depth - 1)
+				if is_connection then
+					local branch_symbol = should_continue and "├" or "└"
+					local wrapped_symbol = should_continue and "│" or " "
+
+					if wrapped_symbol ~= " " then
+						vim.api.nvim_buf_set_extmark(constants.buf_id, constants.ns_id, line_nr, bar_col, {
+							virt_text = { { wrapped_symbol, "DooingGray" } },
+							virt_text_pos = "overlay",
+							virt_text_repeat_linebreak = true,
+							priority = 10,
+						})
+					end
+					vim.api.nvim_buf_set_extmark(constants.buf_id, constants.ns_id, line_nr, bar_col, {
+						virt_text = { { branch_symbol, "DooingGray" } },
+						virt_text_pos = "overlay",
+						virt_text_repeat_linebreak = false,
+						priority = 20,
+					})
+				else
+					symbol = should_continue and "│" or " "
+					if symbol ~= " " then
+						vim.api.nvim_buf_set_extmark(constants.buf_id, constants.ns_id, line_nr, bar_col, {
+							virt_text = { { symbol, "DooingGray" } },
+							virt_text_pos = "overlay",
+							virt_text_repeat_linebreak = true,
+						})
+					end
+				end
+			end
+		end
+	end
 
 	-- Helper function to add highlight
 	local function add_hl(line_nr, start_col, end_col, hl_group)
@@ -219,7 +290,7 @@ function M.render_todos()
 				local due_date_patterns = {
 					"%[!.-%d+.-%d+.-%d+%]", -- Overdue date pattern with ! prefix
 					"%[.-%d+.-%d+.-%d+%]", -- General date pattern with brackets
-					"%[@ .-%]" -- @ format pattern
+					"%[@ .-%]", -- @ format pattern
 				}
 				for _, pattern in ipairs(due_date_patterns) do
 					local start_idx = line:find(pattern)
@@ -259,7 +330,7 @@ function M.render_todos()
 	end
 
 	vim.api.nvim_buf_set_option(constants.buf_id, "modifiable", false)
-	
+
 	-- Restore fold state and cursor position after rendering (with a small delay to ensure buffer is ready)
 	vim.defer_fn(function()
 		restore_fold_state(fold_state)
@@ -279,4 +350,4 @@ function M.render_todos()
 	end, 15)
 end
 
-return M 
+return M

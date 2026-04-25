@@ -448,8 +448,9 @@ function M.open_todo_scratchpad()
 			state.save_todos()
 			vim.notify("Notes saved", vim.log.levels.INFO)
 		end
-
 		close_notes()
+		local rendering = require("dooing.ui.rendering")
+		rendering.render_todos()
 	end
 
 	vim.api.nvim_create_autocmd("WinLeave", {

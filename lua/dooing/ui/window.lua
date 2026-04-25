@@ -81,7 +81,7 @@ end
 local function get_main_border_fused(style, quick_panel_above)
 	local chars = get_border_chars(style)
 	local sep = get_separator_chars(style)
-	
+
 	if quick_panel_above then
 		-- Quick panel is above, so main's TOP edge is the separator
 		return { sep.left, sep.line, sep.right, chars[4], chars[5], chars[6], chars[7], chars[8] }
@@ -94,7 +94,7 @@ end
 -- Create border array for quick keys panel when fused (no border on connecting edge)
 local function get_quick_border_fused(style, quick_panel_above)
 	local chars = get_border_chars(style)
-	
+
 	if quick_panel_above then
 		-- Quick panel is above main, so quick's BOTTOM edge connects (use spaces)
 		return { chars[1], chars[2], chars[3], chars[4], " ", " ", " ", chars[8] }
@@ -309,8 +309,8 @@ function M.create_window()
 	vim.api.nvim_win_set_option(constants.win_id, "linebreak", true)
 	vim.api.nvim_win_set_option(constants.win_id, "breakindent", true)
 	vim.api.nvim_win_set_option(constants.win_id, "breakindentopt", "shift:2")
-	vim.api.nvim_win_set_option(constants.win_id, "showbreak", " ")
-	
+	vim.api.nvim_win_set_option(constants.win_id, "showbreak", "")
+
 	-- Set up folding for nested tasks
 	vim.api.nvim_win_set_option(constants.win_id, "foldmethod", "indent")
 	vim.api.nvim_win_set_option(constants.win_id, "foldlevel", 99) -- Start with all folds open
@@ -319,7 +319,7 @@ end
 
 -- Check if the window is currently open
 function M.is_window_open()
-    return constants.win_id ~= nil and vim.api.nvim_win_is_valid(constants.win_id)
+	return constants.win_id ~= nil and vim.api.nvim_win_is_valid(constants.win_id)
 end
 
 -- Closes all plugin windows
@@ -352,4 +352,4 @@ function M.update_window_title()
 	end
 end
 
-return M 
+return M
