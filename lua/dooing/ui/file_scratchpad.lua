@@ -150,6 +150,8 @@ function M.open(todo)
 	local function save_notes()
 		todo.notes = M.get_relative_path(todo)
 		state.save_todos()
+		local rendering = require("dooing.ui.rendering")
+		rendering.render_todos()
 	end
 	-- Auto-save whenever the buffer loses focus.
 	vim.api.nvim_create_autocmd({ "BufLeave", "FocusLost" }, {
@@ -177,7 +179,6 @@ function M.open(todo)
 			save_notes()
 		end
 	end
-
 	vim.keymap.set("n", "q", close, { buffer = buf, nowait = true, desc = "dooing: close scratchpad" })
 	vim.keymap.set("n", "<localleader>q", close, { buffer = buf, desc = "dooing: close scratchpad" })
 
